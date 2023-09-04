@@ -1,0 +1,7 @@
+/target
+sample/
+*.py
+*.json
+*.bak
+*.wav
+Cargo.lock
