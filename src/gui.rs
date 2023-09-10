@@ -252,7 +252,7 @@ impl CalcWindow {
             };
 
             // SDR plot
-            ui.heading(format!("SDR ({:.6}):", self.states.first().map(|s| -s.cost).unwrap_or(0.0)));
+            ui.heading(format!("SDR ({:.6}):", self.states.last().map(|s| -s.cost).unwrap_or(0.0)));
             Plot::new("SDR").height(300.0).legend(Legend::default()).show(ui, |plot| {
                 plot.line(Line::new(
                     self.states.iter().map(|state| {
