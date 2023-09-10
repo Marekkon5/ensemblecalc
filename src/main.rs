@@ -3,7 +3,7 @@
 
 use anyhow::Error;
 use clap::Parser;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver};
 use kdam::{Column, RichProgress, tqdm, BarExt};
 use std::collections::HashMap;
 use std::fs::File;
@@ -21,6 +21,8 @@ use rodio::source::UniformSourceIterator;
 use threadpool::ThreadPool;
 use rayon::prelude::*;
 
+mod gui;
+
 fn main() {
     std::env::set_var("RUST_LOG", "ensemblecalc=debug,info");
     pretty_env_logger::init();
@@ -30,6 +32,8 @@ fn main() {
 
 #[derive(Parser, Debug)]
 pub enum Cli {
+    GUI {},
+
     /// Run optimizer on folder of references + estimates
     Optimize {
         /// Path to folder of folders
@@ -105,6 +109,10 @@ pub enum Cli {
 
 fn run(cli: Cli) -> Result<(), Error> {
     match cli {
+        Cli::GUI {} => {
+            gui::start_gui();
+            return Ok(())
+        }
         Cli::Optimize { path, ref_name, est_name, sample_rate, threads, filter, tol, max_iters, output, rng_min, rng_max, extra_params } => {
             let data = load_data(path, filter, threads, &ref_name, &est_name, sample_rate)?;
             match optimize_sets(data, tol, max_iters, extra_params, rng_min..=rng_max) {
@@ -139,21 +147,20 @@ pub fn ensemble_dir(path: impl AsRef<Path>, weights: HashMap<String, f32>, sampl
 
 }
 
-/// Load data
-pub fn load_data(
+pub fn load_data_iter(
     path: impl AsRef<Path>, 
     filter: Vec<String>, 
     threads: usize,
     ref_name: &str,
     est_name: &str,
     sample_rate: u32
-) -> Result<TrackSetSet, Error> {
+) -> Result<(usize, Receiver<TrackSet>), Error> {
     // Get list of entries
     let entries = std::fs::read_dir(&path)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir() && e.path().join(ref_name).exists() && e.path().join(est_name).exists())
         .collect::<Vec<_>>();
-    
+
     // Create thread pool
     let pool = ThreadPool::new(threads);
     let (tx, rx) = unbounded();
@@ -174,7 +181,19 @@ pub fn load_data(
             }
         });
     }
-    drop(tx);
+    Ok((count, rx))
+}
+
+/// Load data
+pub fn load_data(
+    path: impl AsRef<Path>, 
+    filter: Vec<String>, 
+    threads: usize,
+    ref_name: &str,
+    est_name: &str,
+    sample_rate: u32
+) -> Result<TrackSetSet, Error> {
+   let (count, rx) = load_data_iter(path, filter, threads, ref_name, est_name, sample_rate)?;
 
     // Progress bar
     let mut pb = RichProgress::new(
@@ -196,16 +215,7 @@ pub fn load_data(
         pb.update(1).ok();
     }
 
-    // Verify
-    if out.sets.is_empty() {
-        return Err(anyhow!("No sets"));
-    }
-    out.indicies = out.sets[0].estimates.iter().map(|(n, _)| n.to_string()).collect();
-    if !out.sets.iter().all(|s| s.estimates.iter().all(|e| out.indicies.contains(&e.0))) {
-        return Err(anyhow!("Not all estimates are present for every set"));
-    }
-
-    Ok(out)
+    Ok(out.verify()?)
 }
 
 /// Run optimizer on set of track sets
@@ -313,6 +323,19 @@ impl CostFunction for TrackSetSet {
     }
 }
 
+impl TrackSetSet {
+    /// Verify this track set and set indicies
+    pub fn verify(mut self) -> Result<TrackSetSet, Error> {
+        if self.sets.is_empty() {
+            return Err(anyhow!("No sets"));
+        }
+        self.indicies = self.sets[0].estimates.iter().map(|(n, _)| n.to_string()).collect();
+        if !self.sets.iter().all(|s| s.estimates.iter().all(|e| self.indicies.contains(&e.0))) {
+            return Err(anyhow!("Not all estimates are present for every set"));
+        }
+        Ok(self)
+    }
+}
 
 /// Decode file to uniform format
 pub fn decode_file(path: impl AsRef<Path>, sample_rate: u32) -> Result<Vec<f32>, Error> {
