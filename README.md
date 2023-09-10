@@ -32,6 +32,14 @@ parent:
       - ...
 ```
 
+### GUI
+
+You can now start the GUI version which should be easier to experiment with:
+
+```
+ensemblecalc gui
+```
+
 ### Optimizer
 
 The simplest way to run optimizer is:
