@@ -1,14 +1,15 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use anyhow::Error;
-use argmin::core::observers::{Observe, ObserverMode};
-use argmin::core::{State, Executor};
+use argmin::core::{State, Solver, Problem};
 use argmin::solver::neldermead::NelderMead;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use eframe::{App, NativeOptions};
 use egui::{Context, SidePanel, Slider, Ui, ProgressBar, Window};
 use egui::plot::{Plot, Line, PlotPoints, Legend};
+use humansize::DECIMAL;
 use rand::Rng;
 use rfd::FileDialog;
 
@@ -36,6 +37,7 @@ struct EnsembleCalcGUI {
 
     files: Arc<Mutex<Option<TrackSetSet>>>,
     files_progress: Arc<Mutex<Option<f32>>>,
+    stop: Arc<AtomicBool>,
 
     windows: Vec<CalcWindow>,
 }
@@ -101,11 +103,14 @@ impl EnsembleCalcGUI {
 
         // Threads
         ui.add(Slider::new(&mut self.threads, 0..=16).text("Loader threads"));
-        ui.add(Slider::new(&mut self.params.tol, 1.0..=0.0000001).logarithmic(true).text("Solver tolerance"));
-        ui.add(Slider::new(&mut self.params.max_iters, 1..=100000).text("Max iterations"));
+        // ui.add(Slider::new(&mut self.params.tol, 1.0..=0.0).logarithmic(true).text("Solver tolerance"));
+        ui.add(Slider::new(&mut self.params.max_iters, 1..=1000000000).logarithmic(true).text("Max iterations"));
         ui.add(Slider::new(&mut self.params.rng_min, -4.0..=4.0).text("Initial weights rng min value"));
         ui.add(Slider::new(&mut self.params.rng_max, -4.0..=4.0).text("Initial weights rng max value"));
-        ui.add(Slider::new(&mut self.params.extra_params, 1..=20).text("Extra params"));
+        ui.add(Slider::new(&mut self.params.alpha, 0.0..=20.0).text("Alpha parameter for reflection"));
+        ui.add(Slider::new(&mut self.params.gamma, 1.0..=20.0).text("Gamma for expansion"));
+        ui.add(Slider::new(&mut self.params.rho, 0.0..=0.5).text("Rho for contraction"));
+        ui.add(Slider::new(&mut self.params.sigma, 0.0..=1.0).text("Sigma for shrinking"));
         
         ui.add_space(32.0);
         ui.horizontal(|ui| {
@@ -120,10 +125,18 @@ impl EnsembleCalcGUI {
             // Start
             if self.files.lock().unwrap().is_some() {
                 if ui.button("Start").clicked() {
-                    self.windows.push(CalcWindow::new(self.params.clone(), self.windows.len(), self.files.clone()));
+                    self.stop.store(false, Ordering::SeqCst);
+                    self.windows.push(CalcWindow::new(self.params.clone(), self.windows.len(), self.files.clone(), self.stop.clone()));
                 }
             }
         });
+
+        // Show size
+        if let Some(files) = self.files.lock().unwrap().as_ref() {
+            ui.add_space(32.0);
+            ui.label(format!("Size of tracks: {}", humansize::format_size(files.calculate_size(), DECIMAL)));
+            ui.label(format!("Indicies: {:?}", files.indicies));
+        }
     }
 
     // Load files in another thread
@@ -167,6 +180,7 @@ impl Default for EnsembleCalcGUI {
             files: Default::default(),
             files_progress: Default::default(),
             windows: vec![],
+            stop: Arc::new(AtomicBool::new(false))
         }
     }
 }
@@ -178,6 +192,11 @@ struct Parameters {
     pub rng_min: f32,
     pub rng_max: f32,
     pub extra_params: usize,
+
+    pub alpha: f32,
+    pub gamma: f32,
+    pub rho: f32,
+    pub sigma: f32
 }
 
 impl Default for Parameters {
@@ -188,6 +207,10 @@ impl Default for Parameters {
             rng_min: 0.0,
             rng_max: 1.0,
             extra_params: 1,
+            alpha: 1.0,
+            gamma: 2.0,
+            rho: 0.5,
+            sigma: 0.5,
         }
     }
 }
@@ -199,39 +222,58 @@ struct CalcWindow {
     state_rx: Receiver<ObserverStateWrap>,
     started: Instant,
     duration: Option<Duration>,
-    indicies: Vec<String>
+    indicies: Vec<String>,
+    stop: Arc<AtomicBool>
 }
 
 impl CalcWindow {
     /// Create new window & thread
-    pub fn new(params: Parameters, id: usize, files: Arc<Mutex<Option<TrackSetSet>>>) -> CalcWindow {
+    pub fn new(params: Parameters, id: usize, files: Arc<Mutex<Option<TrackSetSet>>>, stop: Arc<AtomicBool>) -> CalcWindow {
         let (tx, rx) = crossbeam_channel::unbounded();
         let set = files.clone().lock().unwrap().take().unwrap();
         let indicies = set.indicies.clone();
+        let stop_clone = stop.clone();
 
         std::thread::spawn(move || {
             // Generate mead params
             let param_count = set.indicies.len();
             let mut rng = rand::thread_rng();
             let inputs = (0..param_count + params.extra_params).into_iter().map(|_| (0..param_count).into_iter().map(|_| rng.gen_range(params.rng_min..=params.rng_max)).collect()).collect();
-            let opt: NelderMead<Vec<f32>, f32> = NelderMead::new(inputs).with_sd_tolerance(params.tol).unwrap();
+            let mut opt: NelderMead<Vec<f32>, f32> = NelderMead::new(inputs)
+                .with_alpha(params.alpha).unwrap()
+                .with_gamma(params.gamma).unwrap()
+                .with_rho(params.rho).unwrap()
+                .with_sigma(params.sigma).unwrap()
+                .with_sd_tolerance(params.tol).unwrap();
 
-            // Run optimizer
-            info!("Indicies: {:?}", set.indicies);
-            let mut res = Executor::new(set, opt)
-                .configure(|state| state.max_iters(params.max_iters))
-                .add_observer(GUIObserver { tx: tx.clone() }, ObserverMode::Always)
-                .run()
-                .unwrap();
-            info!("Output: {}", res);
-            let set = res.problem.take_problem().unwrap();
+            // Solver
+            let mut problem = Problem::new(set);
+            let (mut state, _) = opt.init(&mut problem, Default::default()).unwrap();
+            for i in 0..params.max_iters {
+                let r = opt.next_iter(&mut problem, state).unwrap();
+                state = r.0;
+
+                // Update 
+                debug!("iter: {}, cost: {}, params: {:?}", state.get_iter(), state.get_cost(), state.param);
+                tx.send(ObserverStateWrap::State(ObserverState { 
+                    iteration: i,
+                    cost: state.get_cost().to_owned().into(),
+                    param: state.param.clone().unwrap()
+                })).ok();
+
+                // Stop
+                if stop_clone.swap(false, Ordering::SeqCst) {
+                    break;
+                }
+            }
 
             // Return files
-            *files.clone().lock().unwrap() = Some(set);
+            info!("FInished: {:?}", state);
+            *files.clone().lock().unwrap() = Some(problem.take_problem().unwrap());
             tx.send(ObserverStateWrap::Finished).ok();
         });
 
-        CalcWindow { state_rx: rx, id, states: vec![], started: Instant::now(), duration: None, indicies }
+        CalcWindow { state_rx: rx, id, states: vec![], started: Instant::now(), duration: None, indicies, stop }
     }
 
     pub fn update(&mut self, ctx: &Context) {
@@ -279,7 +321,13 @@ impl CalcWindow {
             }
 
             // Other
+            ui.add_space(16.0);
             ui.label(format!("Indicies: {:?}", self.indicies));
+            if self.duration.is_none() && !self.stop.load(Ordering::SeqCst) {
+                if ui.button("Stop").clicked() {
+                    self.stop.store(true, Ordering::SeqCst);
+                }
+            }
 
             // Save
             if self.duration.is_some() && self.states.len() > 0 {
@@ -310,36 +358,4 @@ struct ObserverState {
     pub iteration: u64,
     pub cost: f32,
     pub param: Vec<f32>,
-}
-
-struct GUIObserver {
-    tx: Sender<ObserverStateWrap>
-}
-
-impl<I> Observe<I> for GUIObserver 
-where 
-    I: State, 
-    I::Param: Into<Vec<f32>> + std::fmt::Debug + Clone,
-    I::Float: Into<f32>
-{
-
-    fn observe_init(&mut self, _name: &str, _kv: &argmin::core::KV) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn observe_iter(&mut self, state: &I, _kv: &argmin::core::KV) -> Result<(), Error> {
-        if state.get_param().is_none() {
-            return Ok(())
-        }
-
-        self.tx.send(ObserverStateWrap::State(ObserverState { 
-            iteration: state.get_iter(),
-            cost: state.get_cost().to_owned().into(),
-            param: Into::into(state.get_param().unwrap().clone())
-        }))?;
-
-        debug!("iter: {}, cost: {}, params: {:?}", state.get_iter(), state.get_cost(), state.get_best_param());
-
-        Ok(())
-    }
 }

@@ -335,6 +335,11 @@ impl TrackSetSet {
         }
         Ok(self)
     }
+
+    /// Calculate size of all sets
+    pub fn calculate_size(&self) -> usize {
+        self.sets.iter().map(|s| s.reference.len() * 4 + s.estimates.iter().map(|e| e.1.len()).sum::<usize>() * 4).sum()
+    }
 }
 
 /// Decode file to uniform format
